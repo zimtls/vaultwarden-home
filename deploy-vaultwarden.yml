@@ -52,7 +52,7 @@
  
     - name: Installer les paquets requis
       ansible.builtin.dnf:
-        name: "{{ ['podman', 'nginx', 'firewalld', 'sqlite',
+        name: "{{ ['podman', 'nginx', 'firewalld', 'sqlite', 'acl',
                    'policycoreutils-python-utils', 'tar']
                   + (['certbot'] if vw_acme_enabled else []) }}"
         state: present
