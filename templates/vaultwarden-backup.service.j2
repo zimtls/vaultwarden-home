@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Backup Vaultwarden (dump SQLite + archive)
+
+[Service]
+Type=oneshot
+User={{ vw_user }}
+Group={{ vw_user }}
+ExecStart=/usr/local/sbin/vaultwarden-backup.sh
+# Le log doit être accessible en écriture à l'utilisateur de service
+ExecStartPre=+/usr/bin/touch /var/log/vaultwarden-backup.log
+ExecStartPre=+/usr/bin/chown {{ vw_user }}:{{ vw_user }} /var/log/vaultwarden-backup.log

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# Backup Vaultwarden : dump SQLite cohérent (.backup) + archive des données
+# Logs JSON Lines -> /var/log/vaultwarden-backup.log (ingestion Wazuh)
+set -euo pipefail
+
+DATA_DIR="{{ vw_home }}/data"
+BACKUP_DIR="{{ vw_backup_dir }}"
+RETENTION_DAYS="{{ vw_backup_retention_days }}"
+LOG_FILE="/var/log/vaultwarden-backup.log"
+TS="$(date +%Y%m%d-%H%M%S)"
+WORK_DIR="$(mktemp -d)"
+
+log_json() {
+    local level="$1" msg="$2" extra="${3:-}"
+    printf '{"timestamp":"%s","program":"vaultwarden-backup","level":"%s","message":"%s"%s}\n' \
+        "$(date -Is)" "$level" "$msg" "${extra:+,$extra}" >> "$LOG_FILE"
+}
+
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
+
+log_json "info" "backup started"
+
+# 1. Dump SQLite cohérent (safe à chaud, contrairement à un cp)
+sqlite3 "$DATA_DIR/db.sqlite3" ".backup '$WORK_DIR/db.sqlite3'"
+
+# 2. Copier le reste : clé RSA (jetons de session), attachments, sends, config
+for item in rsa_key.pem rsa_key.pub.pem config.json attachments sends; do
+    [ -e "$DATA_DIR/$item" ] && cp -a "$DATA_DIR/$item" "$WORK_DIR/" || true
+done
+
+# 3. Archive horodatée
+ARCHIVE="$BACKUP_DIR/vaultwarden-$TS.tar.gz"
+tar -czf "$ARCHIVE" -C "$WORK_DIR" .
+SIZE_BYTES="$(stat -c %s "$ARCHIVE")"
+
+# 4. Rotation
+DELETED="$(find "$BACKUP_DIR" -name 'vaultwarden-*.tar.gz' -mtime "+$RETENTION_DAYS" -print -delete | wc -l)"
+
+log_json "info" "backup completed" \
+    "\"archive\":\"$ARCHIVE\",\"size_bytes\":$SIZE_BYTES,\"rotated\":$DELETED"
+
+# 5. (Optionnel) Copie NAS — décommenter et adapter
+# rsync -a "$ARCHIVE" /mnt/nas-backups/vaultwarden/ \
+#     && log_json "info" "nas sync completed" \
+#     || log_json "error" "nas sync failed"

@@ -1,0 +1,44 @@
+# {{ ansible_managed }}
+# Quadlet Vaultwarden — génère vaultwarden.service (scope user)
+[Unit]
+Description=Vaultwarden (rootless)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image={{ vw_image }}
+ContainerName=vaultwarden
+AutoUpdate=registry
+
+# Bind loopback uniquement — nginx en frontal
+PublishPort={{ vw_bind }}:80
+
+# Données persistantes (label SELinux privé)
+Volume={{ vw_home }}/data:/data:Z
+
+# --- Configuration applicative ---
+Environment=DOMAIN=https://{{ vw_domain }}
+Environment=SIGNUPS_ALLOWED={{ vw_signups_allowed }}
+Environment=INVITATIONS_ALLOWED=true
+Environment=SHOW_PASSWORD_HINT=false
+{% if vw_admin_token | length > 0 %}
+Environment=ADMIN_TOKEN={{ vw_admin_token }}
+{% endif %}
+
+# --- Logging fichier (exploitable par un agent Wazuh) ---
+Environment=LOG_FILE=/data/vaultwarden.log
+Environment=LOG_LEVEL=warn
+Environment=EXTENDED_LOGGING=true
+
+# Durcissement conteneur
+ReadOnly=true
+ReadOnlyTmpfs=true
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
