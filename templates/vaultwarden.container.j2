@@ -11,12 +11,14 @@ ContainerName=vaultwarden
 AutoUpdate=registry
 
 # Bind loopback uniquement — nginx en frontal
-PublishPort={{ vw_bind }}:80
+# Port interne 8080 (>1024) pour ne pas nécessiter CAP_NET_BIND_SERVICE
+PublishPort={{ vw_bind }}:8080
 
 # Données persistantes (label SELinux privé)
 Volume={{ vw_home }}/data:/data:Z
 
 # --- Configuration applicative ---
+Environment=ROCKET_PORT=8080
 Environment=DOMAIN=https://{{ vw_domain }}
 Environment=SIGNUPS_ALLOWED={{ vw_signups_allowed }}
 Environment=INVITATIONS_ALLOWED=true
