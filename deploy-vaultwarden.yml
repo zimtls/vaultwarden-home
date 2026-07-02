@@ -1,0 +1,218 @@
+---
+# =============================================================================
+# Déploiement Vaultwarden — Podman rootless + Quadlet systemd
+# Cible : Rocky Linux 9/10 (compatible RHEL-family, podman >= 4.4)
+# Accès : VPN/LAN only — nginx en frontal TLS, Vaultwarden bindé sur loopback
+# =============================================================================
+- name: Déployer Vaultwarden (rootless, quadlet)
+  hosts: vaultwarden
+  become: true
+
+  vars:
+    # --- Identité / réseau ---
+    vw_domain: "vault.home.lan"                  # FQDN vu par les clients Bitwarden
+    vw_allowed_sources:                          # Sous-réseaux autorisés (rich rules firewalld)
+      - 10.100.0.0/24                            # ADM
+      - 172.16.1.0/24                            # WireGuard
+      - 10.53.0.0/24                             # SecuLab
+      - 10.10.0.0/24                             # Wifi
+    # --- Utilisateur rootless ---
+    vw_user: vaultwarden
+    vw_home: /opt/vaultwarden
+    # --- Conteneur ---
+    vw_image: "docker.io/vaultwarden/server:latest"   # Fige un tag en prod, ex: 1.34.1
+    vw_bind: "127.0.0.1:8080"
+    # --- Config applicative ---
+    vw_signups_allowed: "true"                   # Passer à false après création des comptes
+    vw_admin_token: ""                           # Vide = admin panel désactivé (recommandé)
+    # --- TLS (certificat déjà émis, ex: via ACME Vault CA_Long-int ou certbot) ---
+    vw_tls_cert: "/etc/pki/tls/certs/{{ vw_domain }}.crt"   # fullchain
+    vw_tls_key: "/etc/pki/tls/private/{{ vw_domain }}.key"
+    # --- Backup ---
+    vw_backup_dir: /var/backups/vaultwarden
+    vw_backup_retention_days: 14
+    vw_backup_calendar: "*-*-* 03:30:00"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Prérequis système
+    # -------------------------------------------------------------------------
+    - name: Installer les paquets requis
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - nginx
+          - firewalld
+          - sqlite
+          - policycoreutils-python-utils
+          - tar
+        state: present
+
+    - name: Activer firewalld
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    # -------------------------------------------------------------------------
+    # Utilisateur rootless dédié
+    # -------------------------------------------------------------------------
+    - name: Créer l'utilisateur de service {{ vw_user }}
+      ansible.builtin.user:
+        name: "{{ vw_user }}"
+        home: "{{ vw_home }}"
+        create_home: true
+        shell: /sbin/nologin
+        system: false            # UID standard requis pour subuid/subgid
+      register: vw_user_info
+
+    - name: Vérifier la présence des plages subuid/subgid
+      ansible.builtin.lineinfile:
+        path: "{{ item }}"
+        line: "{{ vw_user }}:200000:65536"
+        regexp: "^{{ vw_user }}:"
+        create: true
+        mode: "0644"
+      loop:
+        - /etc/subuid
+        - /etc/subgid
+      notify: Migrer podman rootless
+
+    - name: Activer le lingering (services user au boot sans session)
+      ansible.builtin.command: loginctl enable-linger {{ vw_user }}
+      args:
+        creates: "/var/lib/systemd/linger/{{ vw_user }}"
+
+    - name: Créer l'arborescence de données et quadlet
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ vw_user }}"
+        group: "{{ vw_user }}"
+        mode: "0750"
+      loop:
+        - "{{ vw_home }}/data"
+        - "{{ vw_home }}/.config/containers/systemd"
+
+    # -------------------------------------------------------------------------
+    # Quadlet Vaultwarden (unité systemd user générée par podman)
+    # -------------------------------------------------------------------------
+    - name: Déployer le quadlet vaultwarden.container
+      ansible.builtin.template:
+        src: templates/vaultwarden.container.j2
+        dest: "{{ vw_home }}/.config/containers/systemd/vaultwarden.container"
+        owner: "{{ vw_user }}"
+        group: "{{ vw_user }}"
+        mode: "0640"
+      notify: Redémarrer vaultwarden
+
+    - name: Recharger systemd user et démarrer vaultwarden
+      become_user: "{{ vw_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ vw_user_info.uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ vw_user_info.uid }}/bus"
+      ansible.builtin.systemd_service:
+        name: vaultwarden.service
+        state: started
+        scope: user
+        daemon_reload: true
+
+    # -------------------------------------------------------------------------
+    # Reverse proxy nginx (TLS, host-level)
+    # -------------------------------------------------------------------------
+    - name: Déployer la vhost nginx
+      ansible.builtin.template:
+        src: templates/nginx-vaultwarden.conf.j2
+        dest: /etc/nginx/conf.d/vaultwarden.conf
+        mode: "0644"
+      notify: Recharger nginx
+
+    - name: Autoriser nginx à se connecter au backend (SELinux)
+      ansible.posix.seboolean:
+        name: httpd_can_network_connect
+        state: true
+        persistent: true
+
+    - name: Activer nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: started
+        enabled: true
+
+    # -------------------------------------------------------------------------
+    # Firewalld — HTTPS restreint aux sources LAN/VPN
+    # -------------------------------------------------------------------------
+    - name: Rich rules HTTPS pour les sources autorisées
+      ansible.posix.firewalld:
+        rich_rule: 'rule family="ipv4" source address="{{ item }}" service name="https" accept'
+        zone: public
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ vw_allowed_sources }}"
+
+    - name: S'assurer que le service https n'est PAS ouvert globalement
+      ansible.posix.firewalld:
+        service: https
+        zone: public
+        permanent: true
+        immediate: true
+        state: disabled
+
+    # -------------------------------------------------------------------------
+    # Backup — dump SQLite cohérent + archive, systemd timer
+    # -------------------------------------------------------------------------
+    - name: Créer le répertoire de backup
+      ansible.builtin.file:
+        path: "{{ vw_backup_dir }}"
+        state: directory
+        owner: "{{ vw_user }}"
+        group: "{{ vw_user }}"
+        mode: "0750"
+
+    - name: Déployer le script de backup
+      ansible.builtin.template:
+        src: templates/vaultwarden-backup.sh.j2
+        dest: /usr/local/sbin/vaultwarden-backup.sh
+        mode: "0750"
+        owner: root
+        group: root
+
+    - name: Déployer service + timer de backup
+      ansible.builtin.template:
+        src: "templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - vaultwarden-backup.service
+        - vaultwarden-backup.timer
+      notify: Activer le timer de backup
+
+  handlers:
+    - name: Migrer podman rootless
+      become_user: "{{ vw_user }}"
+      ansible.builtin.command: podman system migrate
+      changed_when: true
+
+    - name: Redémarrer vaultwarden
+      become_user: "{{ vw_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ vw_user_info.uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ vw_user_info.uid }}/bus"
+      ansible.builtin.systemd_service:
+        name: vaultwarden.service
+        state: restarted
+        scope: user
+        daemon_reload: true
+
+    - name: Recharger nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+
+    - name: Activer le timer de backup
+      ansible.builtin.systemd_service:
+        name: vaultwarden-backup.timer
+        state: started
+        enabled: true
+        daemon_reload: true
