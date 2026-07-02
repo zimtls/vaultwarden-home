@@ -29,7 +29,7 @@
     vw_acme_enabled: true
     vw_acme_server: "https://vault.home.lan:8200/v1/pki_int/acme/directory"
     vw_acme_vault_ip: "10.53.0.18"                # IP du serveur Vault (validation HTTP-01) — À ADAPTER
-    vw_acme_ca_cert_src: "/etc/pki/ca-trust/source/anchors/CA_chain.pem"                      # Chemin local (contrôleur) de ta chaîne CA à injecter
+    vw_acme_ca_cert_src: "files/ca-chain.pem"                      # Chemin local (contrôleur) de ta chaîne CA à injecter
                                                  # dans le trust store, ex: files/ca-chain.pem. Vide = skip
     # --- TLS ---
     # Si ACME activé : chemins certbot. Sinon : certificat déposé manuellement.
