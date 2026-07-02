@@ -36,8 +36,8 @@ server {
 }
 
 # Redirection HTTP -> HTTPS (optionnelle, décommenter si port 80 ouvert)
-# server {
-#     listen 80;
-#     server_name {{ vw_domain }};
-#     return 301 https://$host$request_uri;
-# }
+server {
+     listen 80;
+     server_name {{ vw_domain }};
+     return 301 https://$host$request_uri;
+}
