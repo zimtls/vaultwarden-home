@@ -10,7 +10,7 @@
 
   vars:
     # --- Identité / réseau ---
-    vw_domain: "vault.home.lan"                  # FQDN vu par les clients Bitwarden
+    vw_domain: "bitwarden.home.lan"                  # FQDN vu par les clients Bitwarden
     vw_allowed_sources:                          # Sous-réseaux autorisés (rich rules firewalld)
       - 10.100.0.0/24                            # ADM
       - 172.16.1.0/24                            # WireGuard
