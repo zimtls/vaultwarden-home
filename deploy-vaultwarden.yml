@@ -25,35 +25,44 @@
     # --- Config applicative ---
     vw_signups_allowed: "true"                   # Passer à false après création des comptes
     vw_admin_token: ""                           # Vide = admin panel désactivé (recommandé)
-    # --- TLS (certificat déjà émis, ex: via ACME Vault CA_Long-int ou certbot) ---
-    vw_tls_cert: "/etc/pki/tls/certs/{{ vw_domain }}.crt"   # fullchain
-    vw_tls_key: "/etc/pki/tls/private/{{ vw_domain }}.key"
+    # --- ACME (émission automatique via ton Vault PKI) ---
+    vw_acme_enabled: true
+    vw_acme_server: "https://vault.home.lan:8200/v1/pki_int/acme/directory"
+    vw_acme_vault_ip: "10.53.0.X"                # IP du serveur Vault (validation HTTP-01) — À ADAPTER
+    vw_acme_ca_cert_src: ""                      # Chemin local (contrôleur) de ta chaîne CA à injecter
+                                                 # dans le trust store, ex: files/ca-chain.pem. Vide = skip
+    # --- TLS ---
+    # Si ACME activé : chemins certbot. Sinon : certificat déposé manuellement.
+    vw_tls_cert: "{{ '/etc/letsencrypt/live/' + vw_domain + '/fullchain.pem' if vw_acme_enabled else '/etc/pki/tls/certs/' + vw_domain + '.crt' }}"
+    vw_tls_key: "{{ '/etc/letsencrypt/live/' + vw_domain + '/privkey.pem' if vw_acme_enabled else '/etc/pki/tls/private/' + vw_domain + '.key' }}"
     # --- Backup ---
     vw_backup_dir: /var/backups/vaultwarden
     vw_backup_retention_days: 14
     vw_backup_calendar: "*-*-* 03:30:00"
-
+ 
   tasks:
     # -------------------------------------------------------------------------
     # Prérequis système
     # -------------------------------------------------------------------------
+    - name: Installer EPEL (requis pour certbot)
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+      when: vw_acme_enabled
+ 
     - name: Installer les paquets requis
       ansible.builtin.dnf:
-        name:
-          - podman
-          - nginx
-          - firewalld
-          - sqlite
-          - policycoreutils-python-utils
-          - tar
+        name: "{{ ['podman', 'nginx', 'firewalld', 'sqlite',
+                   'policycoreutils-python-utils', 'tar']
+                  + (['certbot'] if vw_acme_enabled else []) }}"
         state: present
-
+ 
     - name: Activer firewalld
       ansible.builtin.systemd_service:
         name: firewalld
         state: started
         enabled: true
-
+ 
     # -------------------------------------------------------------------------
     # Utilisateur rootless dédié
     # -------------------------------------------------------------------------
@@ -65,7 +74,7 @@
         shell: /sbin/nologin
         system: false            # UID standard requis pour subuid/subgid
       register: vw_user_info
-
+ 
     - name: Vérifier la présence des plages subuid/subgid
       ansible.builtin.lineinfile:
         path: "{{ item }}"
@@ -77,12 +86,12 @@
         - /etc/subuid
         - /etc/subgid
       notify: Migrer podman rootless
-
+ 
     - name: Activer le lingering (services user au boot sans session)
       ansible.builtin.command: loginctl enable-linger {{ vw_user }}
       args:
         creates: "/var/lib/systemd/linger/{{ vw_user }}"
-
+ 
     - name: Créer l'arborescence de données et quadlet
       ansible.builtin.file:
         path: "{{ item }}"
@@ -93,7 +102,7 @@
       loop:
         - "{{ vw_home }}/data"
         - "{{ vw_home }}/.config/containers/systemd"
-
+ 
     # -------------------------------------------------------------------------
     # Quadlet Vaultwarden (unité systemd user générée par podman)
     # -------------------------------------------------------------------------
@@ -105,7 +114,7 @@
         group: "{{ vw_user }}"
         mode: "0640"
       notify: Redémarrer vaultwarden
-
+ 
     - name: Recharger systemd user et démarrer vaultwarden
       become_user: "{{ vw_user }}"
       environment:
@@ -116,7 +125,57 @@
         state: started
         scope: user
         daemon_reload: true
-
+ 
+    # -------------------------------------------------------------------------
+    # ACME — émission du certificat via le Vault PKI (HTTP-01 standalone)
+    # -------------------------------------------------------------------------
+    - name: Émission du certificat ACME
+      when: vw_acme_enabled
+      block:
+        - name: Injecter la chaîne CA dans le trust store système
+          ansible.builtin.copy:
+            src: "{{ vw_acme_ca_cert_src }}"
+            dest: /etc/pki/ca-trust/source/anchors/homelab-ca-chain.pem
+            mode: "0644"
+          when: vw_acme_ca_cert_src | length > 0
+          notify: Mettre à jour le trust store
+ 
+        - name: Forcer la mise à jour du trust store avant certbot
+          ansible.builtin.meta: flush_handlers
+ 
+        - name: Autoriser HTTP-01 depuis le serveur Vault uniquement
+          ansible.posix.firewalld:
+            rich_rule: 'rule family="ipv4" source address="{{ vw_acme_vault_ip }}/32" port port="80" protocol="tcp" accept'
+            zone: public
+            permanent: true
+            immediate: true
+            state: enabled
+ 
+        - name: Émettre le certificat (si absent)
+          ansible.builtin.command: >
+            certbot certonly --standalone --non-interactive --agree-tos
+            --server {{ vw_acme_server }}
+            --register-unsafely-without-email
+            -d {{ vw_domain }}
+          args:
+            creates: "/etc/letsencrypt/live/{{ vw_domain }}/fullchain.pem"
+          environment:
+            REQUESTS_CA_BUNDLE: /etc/pki/tls/certs/ca-bundle.crt
+ 
+        - name: Déployer le hook de reload nginx post-renouvellement
+          ansible.builtin.copy:
+            dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+            mode: "0750"
+            content: |
+              #!/usr/bin/env bash
+              systemctl reload nginx
+ 
+        - name: Activer le timer de renouvellement certbot
+          ansible.builtin.systemd_service:
+            name: certbot-renew.timer
+            state: started
+            enabled: true
+ 
     # -------------------------------------------------------------------------
     # Reverse proxy nginx (TLS, host-level)
     # -------------------------------------------------------------------------
@@ -126,19 +185,19 @@
         dest: /etc/nginx/conf.d/vaultwarden.conf
         mode: "0644"
       notify: Recharger nginx
-
+ 
     - name: Autoriser nginx à se connecter au backend (SELinux)
       ansible.posix.seboolean:
         name: httpd_can_network_connect
         state: true
         persistent: true
-
+ 
     - name: Activer nginx
       ansible.builtin.systemd_service:
         name: nginx
         state: started
         enabled: true
-
+ 
     # -------------------------------------------------------------------------
     # Firewalld — HTTPS restreint aux sources LAN/VPN
     # -------------------------------------------------------------------------
@@ -150,7 +209,7 @@
         immediate: true
         state: enabled
       loop: "{{ vw_allowed_sources }}"
-
+ 
     - name: S'assurer que le service https n'est PAS ouvert globalement
       ansible.posix.firewalld:
         service: https
@@ -158,7 +217,7 @@
         permanent: true
         immediate: true
         state: disabled
-
+ 
     # -------------------------------------------------------------------------
     # Backup — dump SQLite cohérent + archive, systemd timer
     # -------------------------------------------------------------------------
@@ -169,7 +228,7 @@
         owner: "{{ vw_user }}"
         group: "{{ vw_user }}"
         mode: "0750"
-
+ 
     - name: Déployer le script de backup
       ansible.builtin.template:
         src: templates/vaultwarden-backup.sh.j2
@@ -177,7 +236,7 @@
         mode: "0750"
         owner: root
         group: root
-
+ 
     - name: Déployer service + timer de backup
       ansible.builtin.template:
         src: "templates/{{ item }}.j2"
@@ -187,13 +246,17 @@
         - vaultwarden-backup.service
         - vaultwarden-backup.timer
       notify: Activer le timer de backup
-
+ 
   handlers:
+    - name: Mettre à jour le trust store
+      ansible.builtin.command: update-ca-trust
+      changed_when: true
+ 
     - name: Migrer podman rootless
       become_user: "{{ vw_user }}"
       ansible.builtin.command: podman system migrate
       changed_when: true
-
+ 
     - name: Redémarrer vaultwarden
       become_user: "{{ vw_user }}"
       environment:
@@ -204,12 +267,12 @@
         state: restarted
         scope: user
         daemon_reload: true
-
+ 
     - name: Recharger nginx
       ansible.builtin.systemd_service:
         name: nginx
         state: reloaded
-
+ 
     - name: Activer le timer de backup
       ansible.builtin.systemd_service:
         name: vaultwarden-backup.timer
